@@ -4,139 +4,207 @@ import requests
 import time
 import io
 
-# --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="EPREL Link Generator", page_icon="⚡", layout="wide")
+# 1. Zmiana tytułu strony na EPRELap_KTA
+st.set_page_config(page_title="EPRELap_KTA", page_icon="⚡", layout="wide")
 
-# --- FUNKCJE POMOCNICZE ---
+# --- FUNKCJE POMOCNICZE DO API ---
 
-def get_eprel_json(eprel_id, api_key):
-    """
-    KROK 1: Pobiera metadane (JSON), abyśmy znali 'productGroup'
-    niezbędne do zbudowania linku.
-    """
-    if not eprel_id or str(eprel_id).lower() == 'nan' or str(eprel_id).strip() == "":
-        return None
-
-    # Endpoint zwracający szczegóły produktu
+def get_eprel_data_by_id(eprel_id, api_key):
+    """Odpytanie bazy przy użyciu Kodu EPREL."""
     url = f"https://eprel.ec.europa.eu/api/product/{eprel_id.strip()}"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json"
-    }
-    
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=12)
         if response.status_code == 200:
             return response.json()
-        return None
     except Exception:
-        return None
+        pass
+    return None
+
+def get_eprel_data_by_ean(ean, api_key):
+    """Odpytanie bazy przy użyciu kodu EAN (GTIN)."""
+    url = f"https://eprel.ec.europa.eu/api/product/gtin/{ean.strip()}"
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
 
 # --- UI STREAMLIT ---
-st.title("⚡ EPREL: Generator Linków do Etykiet")
+
+# 1. Zmiana tytułu aplikacji
+st.title("⚡ EPRELap_KTA")
+
+# 2. Opis działania aplikacji (wymóg informacyjny o EPREL/EAN)
 st.markdown("""
-Aplikacja pobiera dane z API i generuje bezpośrednie linki do etykiet PDF w pliku Excel.
-**Nie pobiera fizycznych plików.**
+Aplikacja służy do odpytywania bazy EPREL o informacje o produkcie na podstawie identyfikatora, 
+którym jest **Kod EPREL** lub **EAN**.
 """)
 
 # Pobieranie klucza z Secrets
 try:
     API_KEY = st.secrets["EPREL_API_KEY"]
 except Exception:
-    st.error("Błąd: Nie znaleziono klucza 'EPREL_API_KEY' w Secrets!")
+    st.error("Błąd: Nie znaleziono klucza 'EPREL_API_KEY' w Secrets na Streamlit Cloud!")
     st.stop()
 
-uploaded_file = st.file_uploader("Załaduj plik Excel (wymagana kolumna: 'kod eprel')", type=["xlsx"])
+# Wczytywanie pliku
+uploaded_file = st.file_uploader("Załaduj plik Excel (.xlsx)", type=["xlsx"])
 
 if uploaded_file:
     df_in = pd.read_excel(uploaded_file)
-    cols_lower = [str(c).lower() for c in df_in.columns]
     
-    # Sprawdzenie czy istnieje wymagana kolumna
-    if 'kod eprel' not in cols_lower:
-        st.error("Plik musi zawierać kolumnę: 'kod eprel'")
-    else:
-        if st.button("Generuj raport z linkami"):
-            final_data = []
+    # 3. Okno z samplem danych (podgląd wierszy i kolumn)
+    st.subheader("📋 Podgląd danych (Sample)")
+    st.markdown("Poniżej znajduje się skrócony widok kolumn i przykładowych danych z Twojego pliku:")
+    st.dataframe(df_in.head(5), use_container_width=True)
+    
+    st.divider()
+    
+    # 4. Wskazanie kolumny / kolumn
+    st.subheader("⚙️ Konfiguracja odpytywania bazy")
+    st.markdown("""
+    **Krok 1:** Wskaż kolumnę lub kolumny, które mają być wykorzystane do odpytania w EPREL. 
+    Należy wskazać kolumny, w których znajduje się kod **EAN** lub **EPREL**.
+    _Uwaga: Kolejność wyboru kolumn określa ich priorytet (pierwsza wybrana ma najwyższy priorytet)._
+    """)
+    
+    selected_cols = st.multiselect(
+        "Wybierz kolumnę/kolumny z pliku bazowego:",
+        options=df_in.columns,
+        help="Wymagane jest wskazanie co najmniej jednej kolumny."
+    )
+    
+    # 5. Określenie na podstawie jakiego identyfikatora odpytywać bazę
+    st.markdown("**Krok 2:** Wybierz, na podstawie jakiego identyfikatora ma być odpytywana baza (sposób budowania zapytania):")
+    selected_idents = st.multiselect(
+        "Wybierz typ identyfikatora / zapytania:",
+        options=["Kod EPREL", "EAN"],
+        default=["Kod EPREL"],
+        help="Jeśli wybierzesz oba, aplikacja w razie niepowodzenia pierwszego zapytania automatycznie sprawdzi drugi identyfikator."
+    )
+    
+    st.divider()
+    
+    # Uruchomienie procesu
+    if st.button("Uruchom przetwarzanie danych"):
+        # 4a. Warunek konieczności wybrania min. jednej kolumny (oraz identyfikatora)
+        if not selected_cols:
+            st.error("Błąd: Musisz wybrać minimum jedną kolumnę, aby rozpocząć!")
+        elif not selected_idents:
+            st.error("Błąd: Musisz wybrać minimum jeden typ identyfikatora!")
+        else:
+            # Listy na dane, które zostaną dopisane na końcu pliku bazowego
+            models = []
+            real_ids = []
+            groups = []
+            classes = []
+            links = []
+            
+            # Liczniki do raportu końcowego (Punkt 7)
+            unique_checked_values = set()
+            unique_success_values = set()
+            total_rows_success = 0
+            
             progress_bar = st.progress(0)
-            
-            # Znalezienie właściwej nazwy kolumny (bez względu na wielkość liter)
-            code_col = [c for c in df_in.columns if c.lower() == 'kod eprel'][0]
-            
             total_rows = len(df_in)
-
+            
+            # Główna pętla po wierszach pliku Excel
             for i, row in df_in.iterrows():
-                # Przygotowanie ID z pliku wejściowego
-                eprel_id_input = str(row[code_col]).split('.')[0].strip() if pd.notnull(row[code_col]) else ""
+                found_data = None
+                matched_value = None
                 
-                # Domyślny wpis (w razie błędu API)
-                entry = {
-                    "Kod EPREL (Input)": eprel_id_input,
-                    "Model": "Brak danych",
-                    "Kod EPREL (API)": "",
-                    "Grupa Produktowa": "",
-                    "Klasa Energetyczna": "",
-                    "Link do Etykiety (PDF)": "Błąd / Nie znaleziono"
-                }
-
-                if eprel_id_input:
-                    # --- KROK 1: Pobranie JSON z API ---
-                    data = get_eprel_json(eprel_id_input, API_KEY)
+                # 4b. Iteracja po wybranych kolumnach (Logika priorytetów kolumn)
+                for col in selected_cols:
+                    val = str(row[col]).split('.')[0].strip() if pd.notnull(row[col]) else ""
+                    if not val or val.lower() == 'nan':
+                        continue
                     
-                    if data:
-                        # --- KROK 2: Mapowanie danych ---
-                        energy_class = data.get("energyClass", "N/A")
-                        model_identifier = data.get("modelIdentifier", "N/A")
-                        # API może zwrócić inny numer rejestracyjny niż podany (np. przekierowanie)
-                        real_id = data.get("registrationNumber") or data.get("eprelRegistrationNumber") or eprel_id_input
-                        product_group = data.get("productGroup", "N/A")
-
-                        entry["Model"] = model_identifier
-                        entry["Kod EPREL (API)"] = real_id
-                        entry["Grupa Produktowa"] = product_group
-                        entry["Klasa Energetyczna"] = energy_class
-
-                        # --- KROK 3: Budowa linku (Tekst) ---
-                        if product_group != "N/A":
-                            # Wzór: .../labels/[grupa]/Label_[id].pdf
-                            pdf_link = f"https://eprel.ec.europa.eu/labels/{product_group}/Label_{real_id}.pdf"
-                            entry["Link do Etykiety (PDF)"] = pdf_link
-                        else:
-                            entry["Link do Etykiety (PDF)"] = "Brak Grupy Produktowej"
-
-                final_data.append(entry)
+                    unique_checked_values.add(val)
+                    
+                    # 5. Iteracja po wybranych identyfikatorach dla danej wartości (Logika priorytetów zapytań)
+                    for ident in selected_idents:
+                        if ident == "Kod EPREL":
+                            found_data = get_eprel_data_by_id(val, API_KEY)
+                        elif ident == "EAN":
+                            found_data = get_eprel_data_by_ean(val, API_KEY)
+                        
+                        if found_data:
+                            matched_value = val
+                            break  # Znaleziono dane -> przerywamy sprawdzanie kolejnych identyfikatorów dla tej wartości
+                    
+                    if found_data:
+                        unique_success_values.add(matched_value)
+                        break  # Znaleziono dane dla tej kolumny -> przerywamy sprawdzanie kolejnych kolumn (Punkt 4b spełniony)
                 
-                # Aktualizacja paska postępu
+                # Przetwarzanie i mapowanie pobranego JSONa
+                if found_data:
+                    total_rows_success += 1
+                    energy_class = found_data.get("energyClass", "N/A")
+                    model_identifier = found_data.get("modelIdentifier", "N/A")
+                    real_id = found_data.get("registrationNumber") or found_data.get("eprelRegistrationNumber") or ""
+                    product_group = found_data.get("productGroup", "N/A")
+                    
+                    if product_group != "N/A" and real_id:
+                        pdf_link = f"https://eprel.ec.europa.eu/labels/{product_group}/Label_{real_id}.pdf"
+                    else:
+                        pdf_link = "Brak grupy produktowej"
+                        
+                    models.append(model_identifier)
+                    real_ids.append(real_id)
+                    groups.append(product_group)
+                    classes.append(energy_class)
+                    links.append(pdf_link)
+                else:
+                    # Jeśli nie odnaleziono danych na podstawie żadnej z kolumn ani identyfikatorów
+                    models.append("Brak danych")
+                    real_ids.append("Brak danych")
+                    groups.append("Brak danych")
+                    classes.append("Brak danych")
+                    links.append("Brak danych")
+                
                 progress_bar.progress((i + 1) / total_rows)
-                time.sleep(0.05) # Delay dla API
-
-            # Zapis wyników do sesji
-            st.session_state.results_df = pd.DataFrame(final_data)
-            st.success("Zakończono! Linki zostały wygenerowane.")
-
-# --- WYŚWIETLANIE I POBIERANIE ---
-if 'results_df' in st.session_state:
-    st.subheader("Podgląd wyników")
-    
-    # Konfiguracja wyświetlania tabeli - kolumna z linkiem jest klikalna
-    st.dataframe(
-        st.session_state.results_df,
-        column_config={
-            "Link do Etykiety (PDF)": st.column_config.LinkColumn("Link PDF")
-        },
-        use_container_width=True
-    )
-    
-    # Generowanie pliku Excel w pamięci
-    buf_excel = io.BytesIO()
-    with pd.ExcelWriter(buf_excel, engine='xlsxwriter') as writer:
-        st.session_state.results_df.to_excel(writer, index=False)
-    
-    # Przycisk pobierania
-    st.download_button(
-        label="📥 Pobierz raport Excel (XLSX)",
-        data=buf_excel.getvalue(),
-        file_name="eprel_linki_etykiet.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+                time.sleep(0.05)  # Delay dla stabilności API
+            
+            # 6. Dane są zapisywane w nowych kolumnach pliku bazowego (Kopia df_in + nowe kolumny)
+            df_out = df_in.copy()
+            df_out["EPREL_Model"] = models
+            df_out["EPREL_ID"] = real_ids
+            df_out["EPREL_Grupa"] = groups
+            df_out["EPREL_Klasa"] = classes
+            df_out["EPREL_Link_PDF"] = links
+            
+            st.success("Przetwarzanie zakończone pomyślnie!")
+            
+            # 7. Krótki raport z działania aplikacji
+            st.subheader("📊 Raport z przetwarzania")
+            col_rep1, col_rep2, col_rep3 = st.columns(3)
+            with col_rep1:
+                st.metric("Sprawdzone unikalne identyfikatory", len(unique_checked_values))
+            with col_rep2:
+                st.metric("Identyfikatory, dla których pobrano dane", len(unique_success_values))
+            with col_rep3:
+                st.metric("Łączna liczba wierszy z danymi", total_rows_success)
+                
+            # Wyświetlenie zaktualizowanego pliku
+            st.subheader("📥 Podgląd zaktualizowanego pliku bazowego")
+            st.dataframe(
+                df_out,
+                column_config={"EPREL_Link_PDF": st.column_config.LinkColumn("Link PDF")},
+                use_container_width=True
+            )
+            
+            # Przygotowanie Excela do pobrania
+            buf_excel = io.BytesIO()
+            with pd.ExcelWriter(buf_excel, engine='xlsxwriter') as writer:
+                df_out.to_excel(writer, index=False)
+            
+            st.download_button(
+                label="📥 Pobierz zaktualizowany raport Excel (XLSX)",
+                data=buf_excel.getvalue(),
+                file_name="eprel_raport_zaktualizowany.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
